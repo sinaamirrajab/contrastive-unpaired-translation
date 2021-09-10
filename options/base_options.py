@@ -26,7 +26,7 @@ class BaseOptions():
         parser.add_argument('--dataroot', default='placeholder', help='path to images (should have subfolders trainA, trainB, valA, valB, etc)')
         parser.add_argument('--name', type=str, default='experiment_name', help='name of the experiment. It decides where to store samples and models')
         parser.add_argument('--easy_label', type=str, default='experiment_name', help='Interpretable name')
-        parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
+        parser.add_argument('--gpu_ids', type=str, default='3', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
         parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
         # model parameters
         parser.add_argument('--model', type=str, default='cut', help='chooses which model to use.')
@@ -59,6 +59,21 @@ class BaseOptions():
         parser.add_argument('--display_winsize', type=int, default=256, help='display window size for both visdom and HTML')
         parser.add_argument('--random_scale_max', type=float, default=3.0,
                             help='(used for single image translation) Randomly scale the image by the specified factor as data augmentation.')
+        # sina starts
+        parser.add_argument('--image_dir_A', type=str, default='/data/sina/datasets/seb/SA_files_processed/', help='path to the cmr images')
+        parser.add_argument('--image_dir_B', type=str, default='/data/sina/dataset/seb/mms2_processed/Philips/', help='path to the cmr images')
+        parser.add_argument('--target_res', type=float, default=2, help='resample images to this resolution')
+        parser.add_argument('--target_crop', type=int, default=256, help='center crop images to this size')
+        parser.add_argument('--valid_data', action='store_true', help='if specified, the data in ImageValid is loaded')
+
+        # adding this option to avoid error when using --model cycle_gan suggested here: https://github.com/taesungp/contrastive-unpaired-translation/issues/41
+        parser.add_argument('--amp', type=util.str2bool, default=False, help='enables or disables automatic mixed precision')
+        # loss plot basic options          # Basic options
+        parser.add_argument('--log_file', type=str, required=False,
+                            help='the path to the log file')
+        parser.add_argument('--out_dir',type=str,default='./curves')
+        parser.add_argument('--nrows',type=int,default=2,help='number of rows in the plot')
+        # sina ends
         # additional parameters
         parser.add_argument('--epoch', type=str, default='latest', help='which epoch to load? set to latest to use latest cached model')
         parser.add_argument('--verbose', action='store_true', help='if specified, print more debugging information')

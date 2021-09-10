@@ -1,3 +1,4 @@
+from re import S
 import numpy as np
 import torch
 from .base_model import BaseModel
@@ -52,7 +53,8 @@ class CUTModel(BaseModel):
             raise ValueError(opt.CUT_mode)
 
         return parser
-
+    def use_gpu(self):
+        return len(self.opt.gpu_ids) > 0
     def __init__(self, opt):
         BaseModel.__init__(self, opt)
 
@@ -74,11 +76,17 @@ class CUTModel(BaseModel):
         # define networks (both generator and discriminator)
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, opt.no_antialias_up, self.gpu_ids, opt)
         self.netF = networks.define_F(opt.input_nc, opt.netF, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
-
+        
+        self.FloatTensor = torch.cuda.FloatTensor if self.use_gpu() \
+            else torch.FloatTensor
+        
+        
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
 
             # define loss functions
+            
+            self.criterionGAN_multi = networks.GANLoss_multi(opt.gan_mode, tensor=self.FloatTensor, opt=self.opt)
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
             self.criterionNCE = []
 
@@ -156,19 +164,65 @@ class CUTModel(BaseModel):
         if self.opt.nce_idt:
             self.idt_B = self.fake[self.real_A.size(0):]
 
+
+    #  sina starts
+    # Given fake and real image, return the prediction of discriminator
+    # for each fake and real image.
+
+    def discriminate(self, fake_image, real_image):
+        # In Batch Normalization, the fake and real images are
+        # recommended to be in the same batch to avoid disparate
+        # statistics in fake and real images.
+        # So both fake and real images are fed to D all at once.
+        fake_and_real = torch.cat([real_image, fake_image], dim=0)
+
+
+        discriminator_out = self.netD(fake_and_real)
+
+        pred_fake, pred_real = self.divide_pred(discriminator_out)
+
+        return pred_fake, pred_real
+        # Take the prediction of fake and real images from the combined batch
+    def divide_pred(self, pred):
+        # the prediction contains the intermediate outputs of multiscale GAN,
+        # so it's usually a list
+        if type(pred) == list:
+            fake = []
+            real = []
+            for p in pred:
+                fake.append([tensor[:tensor.size(0) // 2] for tensor in p])
+                real.append([tensor[tensor.size(0) // 2:] for tensor in p])
+        else:
+            fake = pred[:pred.size(0) // 2]
+            real = pred[pred.size(0) // 2:]
+
+        return fake, real
+
+
+
+    # sina ends
+
     def compute_D_loss(self):
         """Calculate GAN loss for the discriminator"""
         fake = self.fake_B.detach()
-        # Fake; stop backprop to the generator by detaching fake_B
-        pred_fake = self.netD(fake)
-        self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
-        # Real
-        self.pred_real = self.netD(self.real_B)
-        loss_D_real = self.criterionGAN(self.pred_real, True)
-        self.loss_D_real = loss_D_real.mean()
+        if self.opt.netD == 'multi_scale':
+            pred_fake, pred_real =  self.discriminate(fake, self.real_B)
 
-        # combine loss and calculate gradients
-        self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+            self.loss_D_fake = self.criterionGAN_multi(pred_fake, False).mean()
+            self.loss_D_real = self.criterionGAN_multi(pred_real, True).mean()
+            # combine loss and calculate gradients
+            self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+        else:
+            # Fake; stop backprop to the generator by detaching fake_B
+            pred_fake = self.netD(fake)
+            self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
+            # Real
+            self.pred_real = self.netD(self.real_B)
+            loss_D_real = self.criterionGAN(self.pred_real, True)
+            self.loss_D_real = loss_D_real.mean()
+
+            # combine loss and calculate gradients
+            self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
         return self.loss_D
 
     def compute_G_loss(self):
@@ -176,8 +230,12 @@ class CUTModel(BaseModel):
         fake = self.fake_B
         # First, G(A) should fake the discriminator
         if self.opt.lambda_GAN > 0.0:
-            pred_fake = self.netD(fake)
-            self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
+            if self.opt.netD == 'multi_scale':
+                pred_fake, pred_real =  self.discriminate(fake, self.real_B)
+                self.loss_G_GAN = self.criterionGAN_multi(pred_fake, True).mean() * self.opt.lambda_GAN
+            else:
+                pred_fake = self.netD(fake)
+                self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
         else:
             self.loss_G_GAN = 0.0
 

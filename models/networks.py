@@ -321,6 +321,8 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
         net = NLayerDiscriminator(input_nc, ndf, n_layers=3, norm_layer=norm_layer, no_antialias=no_antialias,)
     elif netD == 'n_layers':  # more options
         net = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer, no_antialias=no_antialias,)
+    elif netD == 'multi_scale':  # more options
+        net = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_D=norm, no_antialias=no_antialias,)
     elif netD == 'pixel':     # classify if each pixel is real or fake
         net = PixelDiscriminator(input_nc, ndf, norm_layer=norm_layer)
     elif 'stylegan2' in netD:
@@ -334,6 +336,100 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 ##############################################################################
 # Classes
 ##############################################################################
+# sina starts
+# Defines the GAN loss which uses either LSGAN or the regular GAN.
+# When LSGAN is used, it is basically same as MSELoss,
+# but it abstracts away the need to create the target label tensor
+# that has the same size as the input
+class GANLoss_multi(nn.Module):
+    def __init__(self, gan_mode, target_real_label=1.0, target_fake_label=0.0,
+                 tensor=torch.FloatTensor, opt=None):
+        super(GANLoss_multi, self).__init__()
+        self.real_label = target_real_label
+        self.fake_label = target_fake_label
+        self.real_label_tensor = None
+        self.fake_label_tensor = None
+        self.zero_tensor = None
+        self.Tensor = tensor
+        self.gan_mode = gan_mode
+        self.opt = opt
+        if gan_mode == 'lsgan':
+            pass
+        elif gan_mode == 'original':
+            pass
+        elif gan_mode == 'w':
+            pass
+        elif gan_mode == 'hinge':
+            pass
+        else:
+            raise ValueError('Unexpected gan_mode {}'.format(gan_mode))
+
+    def get_target_tensor(self, input, target_is_real):
+        if target_is_real:
+            if self.real_label_tensor is None:
+                self.real_label_tensor = self.Tensor(1).fill_(self.real_label)
+                self.real_label_tensor.requires_grad_(False)
+            return self.real_label_tensor.expand_as(input)
+        else:
+            if self.fake_label_tensor is None:
+                self.fake_label_tensor = self.Tensor(1).fill_(self.fake_label)
+                self.fake_label_tensor.requires_grad_(False)
+            return self.fake_label_tensor.expand_as(input)
+
+    def get_zero_tensor(self, input):
+        currTensor = self.Tensor if 'HalfTensor' not in input.type() else torch.cuda.HalfTensor
+        if self.zero_tensor is None:
+            self.zero_tensor = currTensor(1).fill_(0)
+            self.zero_tensor.requires_grad_(False)
+        return self.zero_tensor.expand_as(input)
+
+    def loss(self, input, target_is_real, for_discriminator=True):
+        if self.gan_mode == 'original':  # cross entropy loss
+            target_tensor = self.get_target_tensor(input, target_is_real)
+            loss = F.binary_cross_entropy_with_logits(input, target_tensor)
+            return loss
+        elif self.gan_mode == 'lsgan':
+            target_tensor = self.get_target_tensor(input, target_is_real)
+            return F.mse_loss(input, target_tensor)
+        elif self.gan_mode == 'hinge':
+            if for_discriminator:
+                if target_is_real:
+                    minval = torch.min(input - 1, self.get_zero_tensor(input))
+                    loss = -torch.mean(minval)
+                else:
+                    minval = torch.min(-input - 1, self.get_zero_tensor(input))
+                    loss = -torch.mean(minval)
+            else:
+                assert target_is_real, "The generator's hinge loss must be aiming for real"
+                loss = -torch.mean(input)
+            return loss
+        else:
+            # wgan
+            if target_is_real:
+                return -input.mean()
+            else:
+                return input.mean()
+
+    def __call__(self, input, target_is_real, for_discriminator=True):
+        # computing loss is a bit complicated because |input| may not be
+        # a tensor, but list of tensors in case of multiscale discriminator
+        if isinstance(input, list):
+            loss = 0
+            for pred_i in input:
+                if isinstance(pred_i, list):
+                    pred_i = pred_i[-1]
+                loss_tensor = self.loss(pred_i, target_is_real, for_discriminator)
+                bs = 1 if len(loss_tensor.size()) == 0 else loss_tensor.size(0)
+                new_loss = torch.mean(loss_tensor.view(bs, -1), dim=1)
+                loss += new_loss
+            return loss / len(input)
+        else:
+            return self.loss(input, target_is_real, for_discriminator)
+
+
+# sina ends
+
+
 class GANLoss(nn.Module):
     """Define different GAN objectives.
 
@@ -1398,3 +1494,220 @@ class GroupedChannelNorm(nn.Module):
         std = x.std(dim=2, keepdim=True)
         x_norm = (x - mean) / (std + 1e-7)
         return x_norm.view(*shape)
+
+
+# sina starts
+import importlib
+import torch.nn.utils.spectral_norm as spectral_norm
+
+
+def find_class_in_module(target_cls_name, module):
+    target_cls_name = target_cls_name.replace('_', '').lower()
+    clslib = importlib.import_module(module)
+    cls = None
+    for name, clsobj in clslib.__dict__.items():
+        if name.lower() == target_cls_name:
+            cls = clsobj
+
+    if cls is None:
+        print("In %s, there should be a class whose name matches %s in lowercase without underscore(_)" % (module, target_cls_name))
+        exit(0)
+
+    return cls
+
+# Returns a function that creates a normalization function
+# that does not condition on semantic map
+def get_nonspade_norm_layer(norm_type='batch'):
+    # helper function to get # output channels of the previous layer
+    def get_out_channel(layer):
+        if hasattr(layer, 'out_channels'):
+            return getattr(layer, 'out_channels')
+        return layer.weight.size(0)
+
+    # this function will be returned
+    def add_norm_layer(layer):
+        nonlocal norm_type
+        if norm_type.startswith('spectral'):
+            layer = spectral_norm(layer)
+            subnorm_type = norm_type[len('spectral'):]
+
+        if subnorm_type == 'none' or len(subnorm_type) == 0:
+            return layer
+
+        # remove bias in the previous layer, which is meaningless
+        # since it has no effect after normalization
+        if getattr(layer, 'bias', None) is not None:
+            delattr(layer, 'bias')
+            layer.register_parameter('bias', None)
+
+        if subnorm_type == 'batch':
+            norm_layer = nn.BatchNorm2d(get_out_channel(layer), affine=True)
+        # elif subnorm_type == 'sync_batch':
+        #     norm_layer = SynchronizedBatchNorm2d(get_out_channel(layer), affine=True)
+        elif subnorm_type == 'instance':
+            norm_layer = nn.InstanceNorm2d(get_out_channel(layer), affine=False)
+        else:
+            raise ValueError('normalization layer %s is not recognized' % subnorm_type)
+
+        return nn.Sequential(layer, norm_layer)
+
+    return add_norm_layer
+
+
+class BaseNetwork(nn.Module):
+    def __init__(self):
+        super(BaseNetwork, self).__init__()
+
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        return parser
+
+    def print_network(self):
+        if isinstance(self, list):
+            self = self[0]
+        num_params = 0
+        for param in self.parameters():
+            num_params += param.numel()
+        print('Network [%s] was created. Total number of parameters: %.1f million. '
+              'To see the architecture, do print(network).'
+              % (type(self).__name__, num_params / 1000000))
+
+    def init_weights(self, init_type='normal', gain=0.02):
+        def init_func(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm2d') != -1:
+                if hasattr(m, 'weight') and m.weight is not None:
+                    init.normal_(m.weight.data, 1.0, gain)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    init.constant_(m.bias.data, 0.0)
+            elif hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+                if init_type == 'normal':
+                    init.normal_(m.weight.data, 0.0, gain)
+                elif init_type == 'xavier':
+                    init.xavier_normal_(m.weight.data, gain=gain)
+                elif init_type == 'xavier_uniform':
+                    init.xavier_uniform_(m.weight.data, gain=1.0)
+                elif init_type == 'kaiming':
+                    init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+                elif init_type == 'orthogonal':
+                    init.orthogonal_(m.weight.data, gain=gain)
+                elif init_type == 'none':  # uses pytorch's default init method
+                    m.reset_parameters()
+                else:
+                    raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    init.constant_(m.bias.data, 0.0)
+
+        self.apply(init_func)
+
+        # propagate to children
+        for m in self.children():
+            if hasattr(m, 'init_weights'):
+                m.init_weights(init_type, gain)
+
+# =====================================
+class NLayerDiscriminatorMulti(BaseNetwork):
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        parser.add_argument('--n_layers_D', type=int, default=4,
+                            help='# layers in each discriminator')
+        return parser
+
+    def __init__(self, input_nc, ndf=64, n_layers=3, norm_D='batch'):
+        super().__init__()
+
+        kw = 4
+        padw = int(np.ceil((kw - 1.0) / 2))
+        nf = ndf
+
+
+        norm_layer = get_nonspade_norm_layer('spectral' + norm_D)
+        sequence = [[nn.Conv2d(input_nc, nf, kernel_size=kw, stride=2, padding=padw),
+                     nn.LeakyReLU(0.2, False)]]
+
+        for n in range(1, n_layers):
+            nf_prev = nf
+            nf = min(nf * 2, 512)
+            stride = 1 if n == n_layers - 1 else 2
+            sequence += [[norm_layer(nn.Conv2d(nf_prev, nf, kernel_size=kw,
+                                               stride=stride, padding=padw)),
+                          nn.LeakyReLU(0.2, False)
+                          ]]
+
+        sequence += [[nn.Conv2d(nf, 1, kernel_size=kw, stride=1, padding=padw)]]
+
+        # We divide the layers into groups to extract intermediate layer outputs
+        for n in range(len(sequence)):
+            self.add_module('model' + str(n), nn.Sequential(*sequence[n]))
+
+    def forward(self, input):
+        results = [input]
+        for submodel in self.children():
+            intermediate_output = submodel(results[-1])
+            results.append(intermediate_output)
+
+        # get_intermediate_features = not self.opt.no_ganFeat_loss
+        # if get_intermediate_features:
+        #     return results[1:]
+        # else:
+        return results[-1]
+
+
+
+class MultiscaleDiscriminator(BaseNetwork):
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        parser.add_argument('--netD_subarch', type=str, default='n_layer',
+                            help='architecture of each discriminator')
+        parser.add_argument('--num_D', type=int, default=2,
+                            help='number of discriminators to be used in multiscale')
+        opt, _ = parser.parse_known_args()
+
+        # define properties of each discriminator of the multiscale discriminator
+        netD_subarch = 'n_layer'
+        subnetD = find_class_in_module(netD_subarch + 'discriminator',
+                                            'models.networks.discriminator')
+        subnetD.modify_commandline_options(parser, is_train)
+
+        return parser
+
+    def __init__(self, input_nc, ndf, n_layers_D, norm_D='batch', no_antialias=False, ):
+        super().__init__()
+        num_D = 2
+
+        for i in range(num_D):
+            subnetD = self.create_single_discriminator(input_nc, ndf, n_layers_D, norm_D)
+            self.add_module('discriminator_%d' % i, subnetD)
+
+
+
+    def create_single_discriminator(self, input_nc, ndf, n_layers_D, norm_D):
+        subarch = 'n_layer'
+        if subarch == 'n_layer':
+            netD = NLayerDiscriminatorMulti(input_nc, ndf, n_layers_D, norm_D)
+        else:
+            raise ValueError('unrecognized discriminator subarchitecture %s' % subarch)
+        return netD
+
+    def downsample(self, input):
+        return F.avg_pool2d(input, kernel_size=3,
+                            stride=2, padding=[1, 1],
+                            count_include_pad=False)
+
+    # Returns list of lists of discriminator outputs.
+    # The final result is of size opt.num_D x opt.n_layers_D
+    def forward(self, input):
+        result = []
+        # get_intermediate_features = not self.opt.no_ganFeat_loss
+        get_intermediate_features = not True
+        for name, D in self.named_children():
+            out = D(input)
+            if not get_intermediate_features:
+                out = [out]
+            result.append(out)
+            input = self.downsample(input)
+
+        return result
+
+
+# sina ends
